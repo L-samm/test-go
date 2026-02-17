@@ -67,20 +67,34 @@ func GetCurrentThreadKThreadAddress() (uintptr, error) {
 	myPid, _, _ := procGetCurrentProcessId.Call()
 	myTid, _, _ := procGetCurrentThreadId.Call()
 
-	// 1. Récupération de tous les handles du système
+	// STATUS_INFO_LENGTH_MISMATCH (0xC0000004)
+	const STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
+
+	// 1. Récupération de tous les handles du système avec boucle de redimensionnement
 	var returnLength uint32
-	procNtQuerySystemInformation.Call(uintptr(SystemExtendedHandleInformation), 0, 0, uintptr(unsafe.Pointer(&returnLength)))
+	bufferSize := uint32(0x100000) // 1 Mo initial
+	var buffer []byte
+	var ret uintptr
 
-	buffer := make([]byte, returnLength+0x10000)
-	ret, _, _ := procNtQuerySystemInformation.Call(
-		uintptr(SystemExtendedHandleInformation),
-		uintptr(unsafe.Pointer(&buffer[0])),
-		uintptr(len(buffer)),
-		uintptr(unsafe.Pointer(&returnLength)),
-	)
+	for {
+		buffer = make([]byte, bufferSize)
+		ret, _, _ = procNtQuerySystemInformation.Call(
+			uintptr(SystemExtendedHandleInformation),
+			uintptr(unsafe.Pointer(&buffer[0])),
+			uintptr(bufferSize),
+			uintptr(unsafe.Pointer(&returnLength)),
+		)
 
-	if ret != 0 {
-		return 0, fmt.Errorf("NtQuerySystemInformation failure: 0x%x", ret)
+		if ret == 0 {
+			break // Succès
+		}
+
+		if uint32(ret) != STATUS_INFO_LENGTH_MISMATCH {
+			return 0, fmt.Errorf("NtQuerySystemInformation failure: 0x%x", ret)
+		}
+
+		// On ajuste la taille + un extra pour éviter les variations
+		bufferSize = returnLength + 0x10000
 	}
 
 	info := (*SYSTEM_HANDLE_INFORMATION_EX)(unsafe.Pointer(&buffer[0]))
